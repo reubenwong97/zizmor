@@ -63,6 +63,9 @@ of `zizmor`.
 * Fixed a bug where the [cache-poisoning] audit would fail to detect
   some release trigger patterns (#1946)
 
+* Fixed a bug where the `cache-poisoning` audit would raise a finding
+  when the cache state can be statically determined (#1940)
+
 ## 1.24.1
 
 ### Bug Fixes 🐛
