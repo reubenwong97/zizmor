@@ -10,6 +10,8 @@ use crate::config::{Config, UsesPolicy};
 use crate::finding::location::{Locatable, Routable as _};
 use crate::finding::{Confidence, Finding, Fix, Persona, Severity};
 use crate::github;
+use crate::models::pre_commit::PreCommitConfig;
+use crate::models::repo_ref::RepoRef;
 use crate::models::uses::{RepositoryUsesExt as _, RepositoryUsesPattern};
 use crate::models::version::Version;
 use crate::models::workflow::ReusableWorkflowCallJob;
@@ -24,6 +26,86 @@ pub(crate) struct UnpinnedUses {
 audit_meta!(UnpinnedUses, "unpinned-uses", "unpinned action reference");
 
 impl UnpinnedUses {
+    async fn attempt_repo_ref_fix<'a, 'doc>(
+        &self,
+        parent: &impl Locatable<'doc>,
+        uses: impl Into<RepoRef<'doc>>,
+    ) -> Option<Fix<'doc>> {
+        let uses = uses.into();
+        // We need to be online to attempt fixes for this audit.
+        let client = self.client.as_ref()?;
+
+        // There's nothing to fix if the ref is already a commit SHA.
+        if uses.ref_is_commit() {
+            return None;
+        }
+
+        // Only attempt a fix if the git ref _looks_ like it might be a
+        // version, e.g. `@v1`, `@1.2.3`, etc. Technically we can hash-pin
+        // any symbolic ref, but we don't want to do so automatically for refs
+        // like `@main`, `@stable`, etc. because other tools like Dependabot
+        // and pinact don't handle those gracefully.
+        // The user can always pin manually if they so desire.
+        if Version::parse(uses.git_ref()).is_err() {
+            tracing::debug!("not proposing an auto-fix for a non-version ref: {uses}");
+            return None;
+        }
+        let slug = uses.slug()?;
+
+        let commit = match client.commit_for_ref(&slug, uses.git_ref()).await {
+            Ok(Some(commit)) => commit,
+            Ok(None) => {
+                tracing::warn!("no commit matching {uses}");
+                return None;
+            }
+            Err(e) => {
+                // TODO: hard-fail here instead?
+                tracing::warn!(
+                    "failed to look up commit for {uses}: {e}",
+                    uses = uses.raw()
+                );
+                return None;
+            }
+        };
+
+        // Resolve the commit back to its longest tag; pinning to the full
+        // version avoids any later `ref-version-mismatch` findings when the
+        // major tag is mutated by the upstream.
+        let longest_tag = match client.longest_tag_for_commit(&uses.into(), &commit).await {
+            Ok(Some(tag)) => Cow::Owned(tag.name),
+            // Our original tag -> commit lookup succeeded, but this reverse lookup
+            // failed, which makes no sense. Just fall back to what we know.
+            _ => Cow::Borrowed(uses.git_ref()),
+        };
+
+        let action = if let Some(subpath) = uses.subpath() {
+            format!("{}/{}", slug, subpath)
+        } else {
+            slug.to_string()
+        };
+
+        // For the fix itself, we need to situate two patches:
+        // 1. `uses: foo/bar@ref` -> `uses: foo/bar@hashhashhash`
+        // 2. A `# <ref>` comment following the `uses:` clause.
+        Some(Fix {
+            title: format!("pin {action}@{ref} to {commit}", ref = uses.git_ref()),
+            key: parent.location().key,
+            disposition: Default::default(),
+            patches: vec![
+                Patch {
+                    route: parent.route().with_key("uses"),
+                    operation: Op::Replace(format!("{action}@{commit}").into()),
+                },
+                Patch {
+                    route: parent.route().with_key("uses"),
+                    operation: Op::EmplaceComment {
+                        new: format!("# {longest_tag}").into(),
+                    },
+                },
+            ],
+        })
+    }
+
     async fn attempt_fix<'a, 'doc>(
         &self,
         parent: &impl Locatable<'doc>,
@@ -253,6 +335,22 @@ impl Audit for UnpinnedUses {
             .await?
             .into_iter()
             .collect())
+    }
+
+    async fn audit_pre_commit_config<'doc>(
+        &self,
+        pre_commit: &'doc PreCommitConfig,
+        config: &Config,
+    ) -> Result<Vec<Finding<'doc>>, AuditError> {
+        let mut findings = vec![];
+
+        for repo in pre_commit.repos() {
+            let Some(remote) = repo.repo() else {
+                continue;
+            };
+        }
+
+        Ok(findings)
     }
 }
 
